@@ -1,9 +1,8 @@
 """
 SQLAlchemy ORM models.
 
-Financial quantities use Numeric (maps to NUMERIC/DECIMAL in Postgres,
-REAL with driver-level Decimal adaptation in SQLite).  All application
-code works exclusively with ``decimal.Decimal``.
+Financial quantities use exact decimal TEXT in SQLite and NUMERIC(120,36)
+in PostgreSQL. All application arithmetic uses ``decimal.Decimal``.
 
 Tables
 ------
@@ -17,36 +16,41 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
+    CheckConstraint,
     Column,
     DateTime,
+    ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     TypeDecorator,
     UniqueConstraint,
-    ForeignKey,
-    Index,
 )
 
 from app.database import Base
+from app.finance import STORAGE_PRECISION, STORAGE_SCALE
 
 
 class DecimalField(TypeDecorator):
     """
     Stores Decimal as String in SQLite (preserving arbitrary precision and scale
     without floating-point inaccuracies or truncation), while compiling to
-    NUMERIC(38, 18) in PostgreSQL.
+    NUMERIC(120, 36) in PostgreSQL, including derived cost products.
     """
+
     impl = Numeric
     cache_ok = True
 
     def load_dialect_impl(self, dialect):
         if dialect.name == "sqlite":
             return dialect.type_descriptor(String())
-        return dialect.type_descriptor(Numeric(38, 18, asdecimal=True))
+        return dialect.type_descriptor(Numeric(STORAGE_PRECISION, STORAGE_SCALE, asdecimal=True))
 
     def process_bind_param(self, value, dialect):
-        return str(value) if value is not None else None
+        if value is None:
+            return None
+        return str(value) if dialect.name == "sqlite" else value
 
     def process_result_value(self, value, dialect):
         return Decimal(str(value)) if value is not None else None
@@ -58,6 +62,7 @@ class TZDateTime(TypeDecorator):
     In SQLite, DateTime(timezone=True) drops tzinfo on retrieval.
     In PostgreSQL, it compiles to TIMESTAMP WITH TIME ZONE.
     """
+
     impl = DateTime(timezone=True)
     cache_ok = True
 
@@ -85,9 +90,9 @@ class Trade(Base):
     venue = Column(String, nullable=False)
     trade_id = Column(String, nullable=False)
     symbol = Column(String, nullable=False, index=True)
-    side = Column(String, nullable=False)           # "BUY" | "SELL"
+    side = Column(String, nullable=False)  # "BUY" | "SELL"
     quantity = Column(DecimalField, nullable=False)  # always positive
-    price = Column(DecimalField, nullable=False)     # always positive
+    price = Column(DecimalField, nullable=False)  # always positive
     timestamp = Column(TZDateTime, nullable=False)
     created_at = Column(
         TZDateTime,
@@ -97,6 +102,13 @@ class Trade(Base):
 
     __table_args__ = (
         UniqueConstraint("venue", "trade_id", name="uq_venue_trade_id"),
+        CheckConstraint("quantity > 0 AND quantity < 1e24", name="ck_trade_quantity").ddl_if(
+            dialect="postgresql"
+        ),
+        CheckConstraint("price > 0 AND price < 1e24", name="ck_trade_price").ddl_if(
+            dialect="postgresql"
+        ),
+        CheckConstraint("side IN ('BUY', 'SELL')", name="ck_trade_side"),
     )
 
     def __repr__(self) -> str:
@@ -118,9 +130,25 @@ class Position(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     symbol = Column(String, nullable=False, unique=True, index=True)
     net_quantity = Column(DecimalField, nullable=False, default=Decimal("0"))
-    total_cost = Column(DecimalField, nullable=False, default=Decimal("0"))       # qty * avg
-    realized_pnl = Column(DecimalField, nullable=False, default=Decimal("0"))     # avg-cost basis
+    total_cost = Column(DecimalField, nullable=False, default=Decimal("0"))  # qty * avg
+    realized_pnl = Column(DecimalField, nullable=False, default=Decimal("0"))  # avg-cost basis
     fifo_realized_pnl = Column(DecimalField, nullable=False, default=Decimal("0"))  # fifo basis
+
+    __table_args__ = (
+        CheckConstraint(
+            "net_quantity >= 0 AND net_quantity <= 1e30", name="ck_position_quantity"
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint("total_cost >= 0 AND total_cost < 1e70", name="ck_position_cost").ddl_if(
+            dialect="postgresql"
+        ),
+        CheckConstraint(
+            "abs(realized_pnl) < 1e70 AND abs(fifo_realized_pnl) < 1e70",
+            name="ck_position_pnl",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint("net_quantity <> 0 OR total_cost = 0", name="ck_closed_basis").ddl_if(
+            dialect="postgresql"
+        ),
+    )
 
     def __repr__(self) -> str:
         return f"<Position {self.symbol} qty={self.net_quantity}>"
@@ -146,12 +174,15 @@ class FifoLot(Base):
 
     __table_args__ = (
         Index("ix_fifo_lots_symbol_ts", "symbol", "trade_timestamp"),
+        CheckConstraint(
+            "remaining_quantity >= 0 AND remaining_quantity <= original_quantity",
+            name="ck_fifo_remaining",
+        ).ddl_if(dialect="postgresql"),
     )
 
     def __repr__(self) -> str:
         return (
-            f"<FifoLot trade={self.trade_id} "
-            f"remaining={self.remaining_quantity}@{self.buy_price}>"
+            f"<FifoLot trade={self.trade_id} remaining={self.remaining_quantity}@{self.buy_price}>"
         )
 
 
@@ -169,6 +200,11 @@ class LatestPrice(Base):
         default=lambda: datetime.now(timezone.utc),
     )
 
+    __table_args__ = (
+        CheckConstraint("price > 0 AND price < 1e24", name="ck_latest_price").ddl_if(
+            dialect="postgresql"
+        ),
+    )
+
     def __repr__(self) -> str:
         return f"<LatestPrice {self.symbol}={self.price}>"
-
