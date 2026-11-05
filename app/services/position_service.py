@@ -1,52 +1,26 @@
-"""
-Position query service.
-
-Positions are read from the denormalised ``positions`` table which is
-updated transactionally on every trade ingestion.
-"""
+"""Read the committed per-symbol average-cost projection."""
 
 from decimal import Decimal
-from typing import List
 
-from sqlalchemy.orm import Session
-
+from app.finance import money_context
 from app.models import Position
 from app.schemas import PositionResponse
 
 
-def get_positions(db: Session) -> List[PositionResponse]:
-    """Return aggregate position for every symbol that has been traded."""
-
-    rows = db.query(Position).order_by(Position.symbol).all()
-    result: List[PositionResponse] = []
-    for row in rows:
-        net = Decimal(str(row.net_quantity))
-        total = Decimal(str(row.total_cost))
-        avg = total / net if net > 0 else Decimal("0")
-        result.append(
-            PositionResponse(
-                symbol=row.symbol,
-                net_quantity=net,
-                average_cost=avg,
-                total_cost=total,
-            )
+def _report(row):
+    with money_context():
+        return PositionResponse(
+            symbol=row.symbol,
+            net_quantity=row.net_quantity,
+            total_cost=row.total_cost,
+            average_cost=row.total_cost / row.net_quantity if row.net_quantity else Decimal(0),
         )
-    return result
 
 
-def get_position_for_symbol(db: Session, symbol: str) -> PositionResponse | None:
-    """Return the position for a single symbol, or ``None``."""
+def get_positions(db):
+    return [_report(row) for row in db.query(Position).order_by(Position.symbol).all()]
 
-    row = db.query(Position).filter(Position.symbol == symbol.upper()).first()
-    if row is None:
-        return None
-    net = Decimal(str(row.net_quantity))
-    total = Decimal(str(row.total_cost))
-    avg = total / net if net > 0 else Decimal("0")
-    return PositionResponse(
-        symbol=row.symbol,
-        net_quantity=net,
-        average_cost=avg,
-        total_cost=total,
-    )
 
+def get_position_for_symbol(db, symbol):
+    row = db.query(Position).filter_by(symbol=symbol.upper()).one_or_none()
+    return _report(row) if row else None

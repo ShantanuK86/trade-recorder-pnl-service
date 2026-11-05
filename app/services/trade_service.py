@@ -1,238 +1,131 @@
-"""
-Trade ingestion service.
-
-Responsibilities
-----------------
-1. Insert the trade into the ``trades`` table.
-2. Enforce idempotency via the UNIQUE(venue, trade_id) constraint.
-3. Enforce the **oversell check**: a SELL must not take a position below zero.
-4. Update the denormalised ``positions`` row (average-cost method).
-5. Maintain ``fifo_lots`` for the FIFO cost-basis method.
-
-All five steps happen in **one database transaction** so the ledger, the
-position, and the FIFO lots are always consistent.
-"""
+"""One transaction owns the ledger, locked position and FIFO lot mutations."""
 
 from decimal import Decimal
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
+from app.database import write_transaction
+from app.finance import COST_QUANTUM, ConflictError, check_capacity, money_context
 from app.models import FifoLot, Position, Trade
 from app.schemas import TradeCreate, TradeResponse
 
+FIELDS = ("venue", "trade_id", "symbol", "side", "quantity", "price", "timestamp")
+
 
 class OversellError(Exception):
-    """Raised when a SELL would drive a position below zero."""
-
-    def __init__(self, symbol: str, current_qty: Decimal, sell_qty: Decimal):
-        self.symbol = symbol
-        self.current_qty = current_qty
-        self.sell_qty = sell_qty
+    def __init__(self, symbol, current_qty, sell_qty):
+        self.symbol, self.current_qty, self.sell_qty = symbol, current_qty, sell_qty
         super().__init__(
-            f"Oversell rejected: position for {symbol} is {current_qty}, "
-            f"cannot sell {sell_qty}"
+            f"Oversell rejected: position for {symbol} is {current_qty}, cannot sell {sell_qty}"
         )
+
+
+def insert_for(db, model):
+    return pg_insert(model) if db.bind.dialect.name == "postgresql" else sqlite_insert(model)
 
 
 def ingest_trade(db: Session, payload: TradeCreate) -> TradeResponse:
-    """
-    Atomically ingest a trade with idempotency and oversell protection.
+    with write_transaction(db), money_context():
+        values = payload.model_dump()
+        # The unique index resolves simultaneous identities BEFORE balance checks.
+        inserted = db.execute(
+            insert_for(db, Trade)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=["venue", "trade_id"])
+            .returning(Trade.id)
+        ).scalar_one_or_none()
+        if inserted is None:
+            existing = (
+                db.query(Trade).filter_by(venue=payload.venue, trade_id=payload.trade_id).one()
+            )
+            changed = [field for field in FIELDS if getattr(existing, field) != values[field]]
+            if changed:
+                raise ConflictError(
+                    "idempotency_conflict",
+                    "trade identity already exists with different data",
+                    fields=changed,
+                )
+            return TradeResponse.model_validate(existing).model_copy(update={"duplicate": True})
 
-    Returns a ``TradeResponse`` with ``duplicate=True`` when the
-    (venue, trade_id) pair already exists.
-    """
-
-    # ------------------------------------------------------------------ #
-    #  1.  Idempotency — check if trade already exists                    #
-    # ------------------------------------------------------------------ #
-    existing = (
-        db.query(Trade)
-        .filter(Trade.venue == payload.venue, Trade.trade_id == payload.trade_id)
-        .first()
-    )
-    if existing is not None:
-        return TradeResponse(
-            id=existing.id,
-            venue=existing.venue,
-            trade_id=existing.trade_id,
-            symbol=existing.symbol,
-            side=existing.side,
-            quantity=existing.quantity,
-            price=existing.price,
-            timestamp=existing.timestamp,
-            duplicate=True,
-        )
-
-    # ------------------------------------------------------------------ #
-    #  2.  Load or create the position row (with implicit row-level lock) #
-    # ------------------------------------------------------------------ #
-    position = (
-        db.query(Position).filter(Position.symbol == payload.symbol).first()
-    )
-    if position is None:
-        position = Position(
-            symbol=payload.symbol,
-            net_quantity=Decimal("0"),
-            total_cost=Decimal("0"),
-            realized_pnl=Decimal("0"),
-            fifo_realized_pnl=Decimal("0"),
-        )
-        db.add(position)
-        db.flush()  # ensure row exists for later update
-
-    # ------------------------------------------------------------------ #
-    #  3.  Oversell check                                                 #
-    # ------------------------------------------------------------------ #
-    if payload.side == "SELL":
-        if position.net_quantity < payload.quantity:
-            raise OversellError(
+        db.execute(
+            insert_for(db, Position)
+            .values(
                 symbol=payload.symbol,
-                current_qty=Decimal(str(position.net_quantity)),
-                sell_qty=payload.quantity,
+                net_quantity=Decimal(0),
+                total_cost=Decimal(0),
+                realized_pnl=Decimal(0),
+                fifo_realized_pnl=Decimal(0),
             )
-
-    # ------------------------------------------------------------------ #
-    #  4.  Insert the trade                                               #
-    # ------------------------------------------------------------------ #
-    trade = Trade(
-        venue=payload.venue,
-        trade_id=payload.trade_id,
-        symbol=payload.symbol,
-        side=payload.side,
-        quantity=payload.quantity,
-        price=payload.price,
-        timestamp=payload.timestamp,
-    )
-    db.add(trade)
-
-    # Flush to obtain trade.id and to trigger the UNIQUE constraint before
-    # we update positions (belt-and-suspenders idempotency guard).
-    try:
-        db.flush()
-    except IntegrityError:
-        db.rollback()
-        # Race condition: another request inserted the same trade between
-        # our SELECT and INSERT.  Re-query and return as duplicate.
-        existing = (
-            db.query(Trade)
-            .filter(
-                Trade.venue == payload.venue,
-                Trade.trade_id == payload.trade_id,
-            )
-            .first()
+            .on_conflict_do_nothing(index_elements=["symbol"])
         )
-        return TradeResponse(
-            id=existing.id,
-            venue=existing.venue,
-            trade_id=existing.trade_id,
-            symbol=existing.symbol,
-            side=existing.side,
-            quantity=existing.quantity,
-            price=existing.price,
-            timestamp=existing.timestamp,
-            duplicate=True,
+        query = db.query(Position).filter_by(symbol=payload.symbol)
+        if db.bind.dialect.name == "postgresql":
+            query = query.with_for_update()
+        position = query.one()
+
+        if payload.side == "SELL" and payload.quantity > position.net_quantity:
+            raise OversellError(payload.symbol, position.net_quantity, payload.quantity)
+        _update_avg_cost_position(position, payload)
+        _update_fifo(db, inserted, position, payload)
+        check_capacity(
+            position.net_quantity,
+            position.total_cost,
+            position.realized_pnl,
+            position.fifo_realized_pnl,
         )
-
-    # ------------------------------------------------------------------ #
-    #  5.  Update average-cost position                                   #
-    # ------------------------------------------------------------------ #
-    _update_avg_cost_position(position, payload)
-
-    # ------------------------------------------------------------------ #
-    #  6.  Update FIFO lots                                               #
-    # ------------------------------------------------------------------ #
-    _update_fifo(db, trade, position, payload)
-
-    db.commit()
-    db.refresh(trade)
-
-    return TradeResponse(
-        id=trade.id,
-        venue=trade.venue,
-        trade_id=trade.trade_id,
-        symbol=trade.symbol,
-        side=trade.side,
-        quantity=trade.quantity,
-        price=trade.price,
-        timestamp=trade.timestamp,
-        duplicate=False,
-    )
+        # Context exit flushes and commits before the caller receives this response.
+        return TradeResponse(id=inserted, **values)
 
 
-# ── internal helpers ───────────────────────────────────────────────────── #
-
-
-def _update_avg_cost_position(position: Position, payload: TradeCreate) -> None:
-    """Adjust position quantities and costs using the average-cost method."""
-
-    qty = Decimal(str(payload.quantity))
-    price = Decimal(str(payload.price))
-    net = Decimal(str(position.net_quantity))
-    total_cost = Decimal(str(position.total_cost))
-    realized = Decimal(str(position.realized_pnl))
-
+def _update_avg_cost_position(position, payload):
+    qty, price = payload.quantity, payload.price
     if payload.side == "BUY":
-        total_cost += qty * price
-        net += qty
-    else:  # SELL
-        avg_cost = total_cost / net if net != 0 else Decimal("0")
-        realized += qty * (price - avg_cost)
-        net -= qty
-        total_cost = avg_cost * net  # remaining value at average cost
+        position.total_cost += qty * price
+        position.net_quantity += qty
+    else:
+        removed = (
+            position.total_cost
+            if qty == position.net_quantity
+            else (position.total_cost * qty / position.net_quantity).quantize(COST_QUANTUM)
+        )
+        position.realized_pnl += qty * price - removed
+        position.net_quantity -= qty
+        position.total_cost -= removed
 
-    position.net_quantity = net
-    position.total_cost = total_cost
-    position.realized_pnl = realized
 
-
-def _update_fifo(
-    db: Session,
-    trade: Trade,
-    position: Position,
-    payload: TradeCreate,
-) -> None:
-    """Create a new lot (BUY) or consume existing lots oldest-first (SELL)."""
-
-    qty = Decimal(str(payload.quantity))
-    price = Decimal(str(payload.price))
-
+def _update_fifo(db, trade_id, position, payload):
     if payload.side == "BUY":
-        lot = FifoLot(
-            trade_id=trade.id,
-            symbol=payload.symbol,
-            buy_price=price,
-            original_quantity=qty,
-            remaining_quantity=qty,
-            trade_timestamp=payload.timestamp,
-        )
-        db.add(lot)
-    else:  # SELL — consume from oldest lots
-        lots = (
-            db.query(FifoLot)
-            .filter(
-                FifoLot.symbol == payload.symbol,
-                FifoLot.remaining_quantity > 0,
+        db.add(
+            FifoLot(
+                trade_id=trade_id,
+                symbol=payload.symbol,
+                buy_price=payload.price,
+                original_quantity=payload.quantity,
+                remaining_quantity=payload.quantity,
+                trade_timestamp=payload.timestamp,
             )
-            .order_by(FifoLot.trade_timestamp, FifoLot.id)
-            .all()
         )
-
-        remaining_sell = qty
-        fifo_realized = Decimal("0")
-
-        for lot in lots:
-            if remaining_sell <= 0:
-                break
-            lot_remaining = Decimal(str(lot.remaining_quantity))
-            consume = min(remaining_sell, lot_remaining)
-            lot_price = Decimal(str(lot.buy_price))
-
-            fifo_realized += consume * (price - lot_price)
-            lot.remaining_quantity = lot_remaining - consume
-            remaining_sell -= consume
-
-        position.fifo_realized_pnl = (
-            Decimal(str(position.fifo_realized_pnl)) + fifo_realized
-        )
-
+        return
+    lots = (
+        db.query(FifoLot)
+        .filter_by(symbol=payload.symbol)
+        .order_by(FifoLot.trade_timestamp, FifoLot.id)
+        .all()
+    )
+    remaining = payload.quantity
+    profit = Decimal(0)
+    for lot in lots:
+        # SQLite stores exact decimal TEXT; never use lexicographic SQL comparisons.
+        if lot.remaining_quantity <= 0:
+            continue
+        consumed = min(remaining, lot.remaining_quantity)
+        profit += consumed * (payload.price - lot.buy_price)
+        lot.remaining_quantity -= consumed
+        remaining -= consumed
+        if not remaining:
+            break
+    if remaining:
+        raise ConflictError("inconsistent_inventory", "FIFO lots disagree with the position")
+    position.fifo_realized_pnl += profit
