@@ -16,11 +16,10 @@ def list_positions(db: Session = Depends(get_db)):
     return get_positions(db)
 
 
-@router.get("/{symbol}", response_model=PositionResponse)
+@router.get("/{symbol:path}", response_model=PositionResponse)
 def get_position(symbol: str, db: Session = Depends(get_db)):
     """Return the position for a single symbol."""
     pos = get_position_for_symbol(db, symbol)
     if pos is None:
         raise HTTPException(status_code=404, detail="No position for symbol")
     return pos
-

@@ -21,4 +21,3 @@ def run_reconciliation(
     Returns missing, extra, and mismatched trades.
     """
     return reconcile(db, payload)
-

@@ -47,4 +47,3 @@ def create_trade(
         )
 
     return result
-

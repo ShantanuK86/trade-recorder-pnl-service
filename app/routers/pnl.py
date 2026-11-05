@@ -32,4 +32,3 @@ def list_pnl(
     Both average-cost and FIFO figures are included.
     """
     return get_pnl(db, symbol)
-
