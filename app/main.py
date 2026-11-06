@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import init_db
@@ -74,6 +74,25 @@ async def database_error(_request: Request, exc: SQLAlchemyError):
             "detail": "Database operation failed. Retry trades with the same venue, trade_id and payload.",
         },
     )
+
+
+@app.get("/", tags=["ops"])
+def root(request: Request):
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept:
+        return RedirectResponse(url="/docs")
+    return {
+        "service": "Trade Recorder & PnL Service",
+        "status": "ok",
+        "docs": "/docs",
+        "health": "/health",
+        "endpoints": {
+            "trades": "/trades/",
+            "positions": "/positions/",
+            "pnl": "/pnl/",
+            "reconciliation": "/reconciliation/",
+        },
+    }
 
 
 @app.get("/health", tags=["ops"])
